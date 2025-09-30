@@ -1,25 +1,23 @@
-use std::collections::HashMap;
-use tokio::sync::mpsc::{Sender as MPSCSender, Receiver as MPSCReceiver};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::Arc, thread, time::Duration,
+};
+use tokio::sync::mpsc::{self, Sender, Receiver, channel};
+use tokio::sync::Mutex;
 use std::collections::hash_map::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
-use jmphash::jump_hash;
-use tokio::sync::mpsc;
-use std::sync::Arc;
-// use tokio::sync::oneshot::{Sender, Receiver, channel};
-use oneshot::{Sender, Receiver, channel};
 
 enum Commands {
     SetIsActive {
-        client_id: String,
+        client_id: Arc<str>,
         is_active: bool,
     },
     GetIsActive {
-        client_id: String,
+        client_id: Arc<str>,
         sender: Sender<bool>
     },
     AddClient {
-        client_id: String,
+        client_id: Arc<str>,
     }
 }
 
@@ -32,7 +30,7 @@ struct Gateway {
 }
 
 struct GatewayService {
-    clients: Vec<MPSCSender<Commands>>
+    clients: Vec<Sender<Commands>>
 }
 
 impl GatewayService {
@@ -45,43 +43,52 @@ impl GatewayService {
         jump_hash(final_hash, self.clients.len() as i64) as usize
     }
 
+    async fn send_command(&self, client_id: Arc<str>, command: Commands) {
+        let bucket = self.get_bucket(&client_id);
+        if let Some(sender) = self.clients.get(bucket) {
+            if let Err(e) = sender.send(command).await {
+                eprintln!("SendError: {e}");
+            }
+        } else {
+            eprintln!("Client bucket not found for id: {client_id}");
+        }
+    }
+
     async fn add_client(&self, client_id: Arc<str>) {
         let client = self.get_bucket(&client_id);
-        println!("client: {client}");
+        println!("add_client_id {client_id}");
         let x = self.clients[client].clone();
-        if let Err(e) = x.send(Commands::AddClient { client_id: client_id.to_string() }).await {
+        if let Err(e) = x.send(Commands::AddClient { client_id }).await {
             println!("SendError: {e}");
         }
     }
 
     async fn set_is_active(&self, client_id: Arc<str>, is_active: bool) {
         let client = self.get_bucket(&client_id);
-        println!("client: {client}");
+        println!("set_is_active for client_id: {client_id}, value: {is_active}.");
         let x = self.clients[client].clone();
-        if let Err(e) = x.send(Commands::SetIsActive { client_id: client_id.to_string(), is_active }).await {
+        if let Err(e) = x.send(Commands::SetIsActive { client_id, is_active }).await {
             println!("SendError: {e}");
         }
     }
 
     async fn get_is_active(&self, client_id: Arc<str>) -> bool {
-        let (sender, receiver) = channel::<bool>();
+        let (sender, mut receiver) = channel::<bool>(1);
+        self.send_command(
+            client_id.clone(),
+            Commands::GetIsActive { client_id, sender },
+        )
+        .await;
 
-        let client = self.get_bucket(&client_id);
-        let client_sender = self.clients[client].clone();
-        match client_sender.send(Commands::GetIsActive { client_id: client_id.to_string(), sender }).await {
-            Ok(_) => {
-                match receiver.await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        println!("TryRecvError: {:?}", e);
-                        false
-                    },
-                }
+        match receiver.recv().await {
+            Some(status) => {
+                println!("Status: {status}");
+                status
             },
-            Err(e) => {
-                println!("Send Error: {:?}", e);
+            None => {
+                eprintln!("Failed to receive is_active status");
                 false
-            },
+            }
         }
     }
 
@@ -92,63 +99,71 @@ impl Gateway {
         Self { clients: HashMap::default() }
     }
 
-    fn add_client(&mut self, client_id: String) {
-        self.clients.insert(client_id, Client { is_active: false });
+    fn add_client(&mut self, client_id: Arc<str>) {
+        self.clients.insert(client_id.to_string(), Client { is_active: false });
     }
 
-    fn add_is_active(&mut self, client_id: String, is_active: bool) {
-        println!("Add is active, {is_active}");
-        if let Some(client) = self.clients.get_mut(&client_id) {
+    fn set_is_active(&mut self, client_id: Arc<str>, is_active: bool) {
+        if let Some(client) = self.clients.get_mut(&client_id.to_string()) {
             client.is_active = is_active;
         }
     }
 
-    fn get_is_active(&mut self, client_id: String, sender: Sender<bool>) {
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            if let Err(e) = sender.send(client.is_active) {
-                println!("Error");
-            }
+    fn get_is_active(&mut self, client_id: Arc<str>) -> bool {
+        let client_id = &client_id.to_string();
+
+        if let Some(client) = self.clients.get_mut(client_id) {
+            return client.is_active
         } else {
-            if let Err(e) = sender.send(false) {
-                println!("Error");
-                
-            }
+            return false
         }
     }
 }
 
-async fn event_loop (mut gateway: Gateway, mut rx: MPSCReceiver<Commands>) {
-    loop {
-        if let Some(command) = rx.recv().await {
+async fn event_loop (gateway: Arc<Mutex<Gateway>>, mut rx: Receiver<Commands>) {
+     while let Some(command) = rx.recv().await {
+        let gateway = gateway.clone();
+        tokio::task::spawn(async move {
+            let mut g = gateway.lock().await;
             match command {
-                Commands::SetIsActive { client_id, is_active } => gateway.add_is_active(client_id, is_active),
+                Commands::AddClient { client_id } => g.add_client(client_id),
+                Commands::SetIsActive { client_id, is_active } => g.set_is_active(client_id, is_active),
                 Commands::GetIsActive { client_id, sender } => {
-                    gateway.get_is_active(client_id, sender);
+                    let v = g.get_is_active(client_id);
+                    sender.send(v).await.unwrap();
                 },
-                Commands::AddClient { client_id } => {
-                    gateway.add_client(client_id);
-                }
             }
-        }
-
+        });
     }
 }
 
 pub async fn run() {
-    let num_buckets = 4;
+    let gat = Arc::new(Mutex::new(Gateway::new()));
+    let num_buckets = 1;
     let mut service = GatewayService { clients: Vec::with_capacity(num_buckets) };
 
 
     for _ in 0..num_buckets {
     let (tx, rx) = mpsc::channel::<Commands>(1024); // bounded channel for backpressure
         service.clients.push(tx);
-        tokio::spawn(event_loop(Gateway::new(), rx));
+        tokio::spawn(event_loop(gat.clone(), rx));
     }
-
 
     let cid: Arc<str> = Arc::from("client123");
     service.add_client(cid.clone()).await;
+    thread::sleep(Duration::from_millis(150));
+    println!("Add Client");
+
     service.set_is_active(cid.clone(), true).await;
+    thread::sleep(Duration::from_millis(150));
+    println!("Set IsActive");
+
     let is_active = service.get_is_active(cid).await;
     println!("is_active: {is_active}");
+}
+
+// --------------------- Jump Hash Placeholder ---------------------
+fn jump_hash(hash: u64, buckets: i64) -> i64 {
+    // Replace with your actual jump hash implementation
+    (hash % buckets as u64) as i64
 }

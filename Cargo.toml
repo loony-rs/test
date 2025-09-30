@@ -6,9 +6,7 @@ edition = "2021"
 
 [dependencies]
 bincode = { version="2.0.0", features=["serde", "derive", "std", "alloc"] }
-jmphash = "0.1.0"
 mpsc = "0.2.6"
-oneshot = "0.1.11"
 proc-macro2 = "1.0.93"
 quote = "1.0.38"
 serde = { version="1.0.218", features=["derive"]}
